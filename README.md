@@ -67,6 +67,7 @@
   - [x] Release inference code and checkpoints
   - [x] GUI demo Support
   - [x] End-end adaptive FP8 precision
+  - [ ] Support model offloading for consumer GPUs (e.g., RTX 4090, RTX 5090) to reduce memory usage
   - [ ] Support FP4 precision for B-series GPUs (e.g., RTX 5090, B100, B200)
   - [ ] Release training code
 
