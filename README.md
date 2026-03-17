@@ -195,8 +195,6 @@ torchrun --nproc_per_node=2 --master_port=$(shuf -n 1 -i 10000-65535) \
   --video_save_path ./generated_videos
 ```
 
-
-
 ## 📚 Citation
 
 ```bibtex
@@ -210,3 +208,15 @@ torchrun --nproc_per_node=2 --master_port=$(shuf -n 1 -i 10000-65535) \
       url={https://arxiv.org/abs/2603.11746}, 
 }
 ```
+## 📮 Contact Us
+If you are interested in leaving a message to our work, feel free to email dingchengzhen@soulapp.cn.
+
+You’re welcome to join our WeChat group or Soul group for technical discussions.
+<p align="center">
+  <span style="display: inline-block; margin-right: 10px;">
+    <img src="assets/QRCode_WX.jpg" width="200" alt="WeChat Group QR Code"/>
+  </span>
+  <span style="display: inline-block;">
+    <img src="assets/QRCode_Soul.png" width="300" alt="WeChat QR Code"/>
+  </span>
+</p>
