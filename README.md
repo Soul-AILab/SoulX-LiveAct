@@ -16,7 +16,7 @@
 
 (II) We introduce **ConvKV Memory**, a lightweight plug-in compression mechanism that enables constant-memory hour-scale video generation with negligible overhead.
 
-(III) We develop an optimized real-time system that achieves **20 FPS using only two H100/H200 GPUs** with end-end adaptive FP8 precision, sequence parallelism, and communication-computation parallelism at 720×416 or 512×512 resolution.
+(III) We develop an optimized real-time system that achieves **20 FPS using only two H100/H200 GPUs** with end-end adaptive FP8 precision, sequence parallelism, and operator fusion at 720×416 or 512×512 resolution.
 
 
 <div align="center">
@@ -62,6 +62,7 @@
   - [x] Release inference code and checkpoints
   - [x] GUI demo Support
   - [x] End-end adaptive FP8 precision
+  - [ ] Support model offloading for consumer GPUs (e.g., RTX 4090, RTX 5090) to reduce memory usage
   - [ ] Support FP4 precision for B-series GPUs (e.g., RTX 5090, B100, B200)
   - [ ] Release training code
 
@@ -82,11 +83,14 @@ conda install conda-forge::sox -y
 To enable fp8 attention kernel, you need to install SageAttention:
 * Install SageAttention:
   ```bash
-  pip install sageattention==2.2.0 --no-build-isolation
+  git clone https://github.com/thu-ml/SageAttention.git
+  cd SageAttention
+  git checkout v2.2.0
+  python setup.py install
   ```
 
 * (Optional) Install the modified version of SageAttention: 
-  To enable SageAttention for QKV communication–computation parallelism, you need to install it by the following command:
+  To enable SageAttention for QKV's operator fusion, you need to install it by the following command:
 
   ```bash
   git clone https://github.com/ZhiqiJiang/SageAttentionFusion.git
@@ -98,6 +102,14 @@ To enable fp8 attention kernel, you need to install SageAttention:
   To enable fp8 gemm kernel, you need to install vllm:
   ```bash
   pip install vllm==0.11.0
+  ```
+
+#### Step 4 Install LightVAE:：
+
+  ```bash
+  git clone https://github.com/ModelTC/LightX2V
+  cd LightX2V
+  python setup_vae.py install
   ```
 
 
