@@ -159,7 +159,7 @@ torchrun --nproc_per_node=2 --master_port=$(shuf -n 1 -i 10000-65535)  \
     --input_json examples/example.json
 ```
 
-#### 3. Run with action or emotion editing
+#### 3. Run with action or emotion editing at real-time streaming performance
 
 ```bash
 USE_CHANNELS_LAST_3D=1 CUDA_VISIBLE_DEVICES=0,1 \
