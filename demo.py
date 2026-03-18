@@ -23,7 +23,6 @@ from wan.modules.t5 import T5EncoderModel
 from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 from transformers import Wav2Vec2FeatureExtractor
 from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
-from model_liveact.model_memory_sp import WanModel
 import queue
 from datetime import timedelta
 import errno
@@ -93,31 +92,50 @@ class DistributedVideoEngine:
     def __init__(self, args):
         self.args = args
         self.rank = int(os.getenv("RANK", 0))
-        self.world_size = int(os.getenv("WORLD_SIZE", 2))
+        self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
-        self.device = torch.device(f"cuda:{self.local_rank}")
+        self.device = self.local_rank
         self.width, self.height = [int(x) for x in args.size.split('*')]
+        self.use_dist = self.world_size > 1
 
         self.video_save_root = os.path.abspath(getattr(args, "video_save_path", "./generated_videos"))
         os.makedirs(self.video_save_root, exist_ok=True)
 
-        if not dist.is_initialized():
+        if not dist.is_initialized() and self.world_size>1:
             torch.cuda.set_device(self.device)
             dist.init_process_group(backend="nccl", init_method="env://", rank=self.rank, world_size=self.world_size)
 
-        # 发python消息，防止长时间不操作，nccl超时异常
-        self.control_pg = dist.new_group(backend="gloo")
+        # 多卡时触发：发送python消息，防止长时间不操作，nccl超时异常
+        self.control_pg = dist.new_group(backend="gloo") if self.use_dist else None
 
-        if self.world_size>0:
+        if self.world_size>1:
             from xfuser.core.distributed import init_distributed_environment, initialize_model_parallel
             init_distributed_environment(rank=self.rank, world_size=self.world_size)
             initialize_model_parallel(sequence_parallel_degree=self.world_size, ring_degree=1,
                                       ulysses_degree=self.world_size)
 
         # 加载核心生成模型 (Wan2.1)
+        if self.world_size>1:
+            from model_liveact.model_memory_sp import WanModel
+        else:
+            from model_liveact.model_memory import WanModel
         self.wan_i2v_model = WanModel.from_pretrained(args.ckpt_dir, torch_dtype=torch.bfloat16,
                                                       low_cpu_mem_usage=False)
-        self.wan_i2v_model = self.wan_i2v_model.to(self.device, dtype=torch.bfloat16)
+        self.wan_i2v_model = self.wan_i2v_model.to(dtype=torch.bfloat16)
+
+        enable_fp8_gemm(self.wan_i2v_model, options=FP8GemmOptions())
+        if args.block_offload:
+            for name, child in self.wan_i2v_model.named_children():
+                if name != 'blocks':
+                    child.to(self.device)
+            self.wan_i2v_model.enable_block_offload(
+                onload_device=torch.device(f"cuda:{self.device}"),
+            )
+        else:
+            self.wan_i2v_model = self.wan_i2v_model.to(self.device)
+        self.wan_i2v_model.freqs = self.wan_i2v_model.freqs.to(self.device)
+        self.wan_i2v_model.eval()
+        self.wan_i2v_model = torch.compile(self.wan_i2v_model, mode="max-autotune-no-cudagraphs", backend="inductor", dynamic=False)
 
         # 采样参数
         self.vae_stride = (4, 8, 8)
@@ -151,32 +169,37 @@ class DistributedVideoEngine:
         self.wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.wav2vec_dir,
                                                                                   local_files_only=True)
 
-        # 推理模式
-        enable_fp8_gemm(self.wan_i2v_model, options=FP8GemmOptions())
-        self.wan_i2v_model.eval()
-        self.vae.model.eval()
-
+        torch.cuda.empty_cache()
         # 初始化KV Cache
         self.blksz_lst = [6, 8]
         self.frame_len = (self.height // (self.patch_size[1] * self.vae_stride[1])) * (
                     self.width // (self.patch_size[2] * self.vae_stride[2]))
-        self.kv_cache = {
-            i: {layer_id: {
-                'k': torch.zeros([1, self.frame_len * sum(self.blksz_lst) // self.world_size, 40, 128],
-                                 dtype=torch.bfloat16, device=self.device),
-                'v': torch.zeros([1, self.frame_len * sum(self.blksz_lst) // self.world_size, 40, 128],
-                                 dtype=torch.bfloat16, device=self.device),
-                'mean_memory': True,
-                'offload_cache': False,
-            } for layer_id in range(40)
-            } for i in range(len(self.timesteps) - 1)
-        }
+        kv_cache_tokens = self.frame_len * sum(self.blksz_lst) // self.world_size
+        kv_cache_device = self.device
+        kv_cache_dtype = torch.float8_e4m3fn if args.fp8_kv_cache else torch.bfloat16
+        kv_scale_shape = (1, kv_cache_tokens, 40, 1)
+        self.kv_cache  = \
+            {
+                i: {
+                    layer_id: {
+                        'k': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+                        'v': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+                        'k_scale': torch.ones(kv_scale_shape, dtype=torch.float32,
+                                              device=kv_cache_device) if args.fp8_kv_cache else None,
+                        'v_scale': torch.ones(kv_scale_shape, dtype=torch.float32,
+                                              device=kv_cache_device) if args.fp8_kv_cache else None,
+                        'mean_memory': False,
+                        'offload_cache': False,
+                        'fp8_kv_cache': args.fp8_kv_cache,
+                    }
+                    for layer_id in range(40)
+                } for i in range(len(self.timesteps) - 1)
+            }
         for n in range(40):
             self.wan_i2v_model.blocks[n].self_attn.init_kvidx(self.frame_len, self.world_size)
 
         # 编译加速
-        self.wan_i2v_model = torch.compile(self.wan_i2v_model, mode="max-autotune-no-cudagraphs", backend="inductor",
-                                           dynamic=False)
+        self.vae.model.eval()
         # self.vae.encode = torch.compile(self.vae.encode)
         self.vae.decode = torch.compile(self.vae.decode)
 
@@ -622,10 +645,12 @@ class DistributedVideoEngine:
                     start_time = time.perf_counter()
 
                 cached_context = context_0
+                update_context = False
                 if prompt_list:
                     for k, v in edit_prompts.items():
                         if k[0] <= iteration <= k[1]:
                             cached_context = v
+                            update_context = True
                             break
 
                 audio_start_idx = 0 if iteration == 0 else (iteration - 1) * self.blksz_lst[-1] * self.vae_stride[0]
@@ -661,7 +686,7 @@ class DistributedVideoEngine:
                             [latent],
                             t=timestep,
                             kv_cache=self.kv_cache[i],
-                            skip_audio=False if i in [1, 2] else True,
+                            skip_audio=False if i in [1, 2] else update_context,
                             **arg_c
                         )[0]
                         dt = (self.timesteps[i] - self.timesteps[i + 1]) / 1000
@@ -765,8 +790,9 @@ def control_loop_rank0():
         except queue.Empty:
             params = None
 
-        payload = [params]
-        dist.broadcast_object_list(payload, src=0, group=engine.control_pg)
+        if engine.use_dist:
+            payload = [params]
+            dist.broadcast_object_list(payload, src=0, group=engine.control_pg)
 
         if params is None:
             continue
@@ -784,6 +810,8 @@ def control_loop_rank0():
 
 
 def control_loop_rank_other():
+    if not engine.use_dist:
+        return
     while True:
         payload = [None]
         dist.broadcast_object_list(payload, src=0, group=engine.control_pg)
@@ -793,7 +821,7 @@ def control_loop_rank_other():
             continue
 
         engine.generate_and_push(params)
-        # torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         gc.collect()
 
 
@@ -884,13 +912,23 @@ if __name__ == '__main__':
     parser.add_argument("--ckpt_dir", type=str, required=True)
     parser.add_argument("--wav2vec_dir", type=str, required=True)
     parser.add_argument("--t5_cpu", action="store_true")
-    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--port", type=int, default=5001)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--size", type=str, default="720*416",
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image.")
     parser.add_argument("--video_save_path", type=str, default="./generated_videos",
                         help="Directory to save final generated videos.")
+    parser.add_argument(
+        "--fp8_kv_cache",
+        action="store_true",
+        default=False,
+        help="Whether to store kv cache in FP8 and dequantize to BF16 on use.")
+    parser.add_argument(
+        "--block_offload",
+        action="store_true",
+        default=False,
+        help="Whether to offload WanModel blocks to CPU between block forwards.")
     args = parser.parse_args()
 
     try:

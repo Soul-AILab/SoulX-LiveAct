@@ -282,6 +282,7 @@ def generate(args):
         audio_embedding = get_embedding(audio[0], wav2vec_feature_extractor, audio_encoder, device=device)
         audio_len = audio_ori.size(1) / sr_ori
 
+        torch.manual_seed(args.seed)
         ref_target_masks = torch.ones(3, height // vae_stride[1], width // vae_stride[2]).to(device, torch.bfloat16)
         frame_num = (sum(blksz_lst) - 1) * 4 + 1
         msk = get_msk(frame_num, cond_image, vae_stride, device)
@@ -327,7 +328,6 @@ def generate(args):
                         update_context = True
                         break
 
-            torch.manual_seed(args.seed)
             with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
                 f = _ if _ <= 1 else 1
                 latent = torch.randn(16, blksz_lst[f], height // vae_stride[1], width // vae_stride[2],
