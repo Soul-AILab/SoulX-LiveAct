@@ -72,7 +72,7 @@ def _parse_args():
         "--block_offload",
         action="store_true",
         default=False,
-        help="Whether to offload WanModel blocks to CPU between block forwards.")
+        help="Whether to offload model blocks to CPU between block forwards.")
     parser.add_argument(
         "--fps",
         type=int,

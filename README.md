@@ -217,7 +217,7 @@ python generate.py \
 | `--steam_audio`   | bool  | No       | false   | Whether inference with steaming audio.                                                        |
 | `--mean_memory`   | bool  | No       | false   | Whether to use the mean memory strategy during inference for further performance improvement. |
 | `--fp8_kv_cache`   | bool  | No       | false   | Whether to store kv cache in FP8 and dequantize to BF16 on use. FP8 KV cache may slightly affect generation quality.|
-| `--block_offload`   | bool  | No       | false   | Whether to offload WanModel blocks to CPU between block forwards.|
+| `--block_offload`   | bool  | No       | false   | Whether to offload model blocks to CPU between block forwards.|
 
 
 ### 💻 GUI demo
