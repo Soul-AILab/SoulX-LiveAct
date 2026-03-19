@@ -645,12 +645,10 @@ class DistributedVideoEngine:
                     start_time = time.perf_counter()
 
                 cached_context = context_0
-                update_context = False
                 if prompt_list:
                     for k, v in edit_prompts.items():
                         if k[0] <= iteration <= k[1]:
                             cached_context = v
-                            update_context = True
                             break
 
                 audio_start_idx = 0 if iteration == 0 else (iteration - 1) * self.blksz_lst[-1] * self.vae_stride[0]
@@ -686,7 +684,7 @@ class DistributedVideoEngine:
                             [latent],
                             t=timestep,
                             kv_cache=self.kv_cache[i],
-                            skip_audio=False if i in [1, 2] else update_context,
+                            skip_audio=False if i in [1, 2] else True,
                             **arg_c
                         )[0]
                         dt = (self.timesteps[i] - self.timesteps[i + 1]) / 1000

@@ -72,7 +72,7 @@ def _parse_args():
         "--block_offload",
         action="store_true",
         default=False,
-        help="Whether to offload model blocks to CPU between block forwards.")
+        help="Whether to offload WanModel blocks to CPU between block forwards.")
     parser.add_argument(
         "--fps",
         type=int,
@@ -282,7 +282,6 @@ def generate(args):
         audio_embedding = get_embedding(audio[0], wav2vec_feature_extractor, audio_encoder, device=device)
         audio_len = audio_ori.size(1) / sr_ori
 
-        torch.manual_seed(args.seed)
         ref_target_masks = torch.ones(3, height // vae_stride[1], width // vae_stride[2]).to(device, torch.bfloat16)
         frame_num = (sum(blksz_lst) - 1) * 4 + 1
         msk = get_msk(frame_num, cond_image, vae_stride, device)
@@ -301,6 +300,7 @@ def generate(args):
         iter_total_num = int(audio_len / (vae_stride[0] * blksz_lst[-1] / fps)) + 1
         print('----iter_total_num=', iter_total_num)
         gen_video_list = []
+        torch.manual_seed(args.seed)
         for _ in range(iter_total_num):
             t1 = time.time()
             audio_start_idx, audio_end_idx = 0, frame_num
@@ -320,12 +320,10 @@ def generate(args):
             y_cut = y[:, :, :frame_num // 4 + 1, ...]
 
             _context = context
-            update_context = False
             if edit_prompts:
                 for k, v in edit_prompts.items():
                     if ast.literal_eval(k)[0] <= _ <= ast.literal_eval(k)[1]:
                         _context = [v]
-                        update_context = True
                         break
 
             with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
@@ -339,7 +337,7 @@ def generate(args):
                              'start_idx': sum(blksz_lst[:f]) * frame_len, 'end_idx': sum(blksz_lst[:f + 1]) * frame_len,
                              'update_cache': _ > 1}
                     noise_pred = wan_i2v_model([latent.to(device)], t=timestep, kv_cache=kv_cache[i],
-                                               skip_audio=False if i in [1, 2] else update_context, **arg_c)[0]
+                                               skip_audio=False if i in [1, 2] else False, **arg_c)[0]
 
                     if args.audio_cfg>1.0 and i in [1, 2]:
                         arg_null_audio = \
