@@ -274,7 +274,7 @@ If you are interested in leaving a message to our work, feel free to email dingc
 You’re welcome to join our WeChat group or Soul group for technical discussions.
 <p align="center">
   <span style="display: inline-block; margin-right: 10px;">
-    <img src="assets/QRCode_WX.jpg" width="200" alt="WeChat Group QR Code"/>
+    <img src="assets/QRCode_WX.png" width="200" alt="WeChat Group QR Code"/>
   </span>
   <span style="display: inline-block;">
     <img src="assets/QRCode_Soul.png" width="300" alt="WeChat QR Code"/>
