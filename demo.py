@@ -23,6 +23,7 @@ from wan.modules.t5 import T5EncoderModel
 from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 from transformers import Wav2Vec2FeatureExtractor
 from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
+from fp4_gemm import FP4GemmOptions, enable_fp4_gemm
 import queue
 from datetime import timedelta
 import errno
@@ -67,8 +68,9 @@ def get_local_ip():
 
 def resample_audio(audio, sr, fps):
     rate = 25 / fps
-    y, sr_out = torchaudio.sox_effects.apply_effects_tensor(audio, sr, [["tempo", f"{rate}"]])
-    resampler = T.Resample(sr_out, 16000).to(audio.device)
+    # torchaudio dropped sox_effects in 2.11; functional.speed is the documented replacement
+    y, _ = torchaudio.functional.speed(audio, sr, factor=rate)
+    resampler = T.Resample(sr, 16000).to(audio.device)
     return resampler(y) * 3.0, 16000
 
 
@@ -115,7 +117,11 @@ class DistributedVideoEngine:
                                       ulysses_degree=self.world_size)
 
         # 加载核心生成模型 (Wan2.1)
-        if self.world_size>1:
+        # --tp: tensor-parallel (head-shard cache + Megatron self-attn/FFN), supports world_size in {1,2,4,8}
+        # else: existing path (Ulysses SP for world>1, single-GPU otherwise; SP hardcoded for world<=2)
+        if getattr(args, 'tp', False):
+            from model_liveact.model_memory_tp import WanModel
+        elif self.world_size > 1:
             from model_liveact.model_memory_sp import WanModel
         else:
             from model_liveact.model_memory import WanModel
@@ -123,7 +129,21 @@ class DistributedVideoEngine:
                                                       low_cpu_mem_usage=False)
         self.wan_i2v_model = self.wan_i2v_model.to(dtype=torch.bfloat16)
 
-        enable_fp8_gemm(self.wan_i2v_model, options=FP8GemmOptions())
+        if getattr(args, 'tp', False) and self.world_size > 1:
+            # Pre-slice TP-relevant weights so FP8 GEMM can wrap them transparently.
+            # MUST run BEFORE enable_fp8_gemm.
+            from model_liveact.model_memory_tp import shard_wan_model_for_tp
+            shard_wan_model_for_tp(self.wan_i2v_model)
+
+        # Disabled: vllm 0.11.0 (CUDA 12) incompatible with system CUDA 13. Re-enable after upgrading vllm to a cu13 build.
+        # When re-enabled, this call must come AFTER shard_wan_model_for_tp above so that FP8Linear
+        # wraps the rank-local weight tensors and quantizes only that rank's slice.
+        # enable_fp8_gemm(self.wan_i2v_model, options=FP8GemmOptions())
+        # FP4 path (Blackwell only). Mutually exclusive with --fp8_gemm; both
+        # paths require vllm so the same cu13 caveat above applies. Wrap order
+        # is identical: must run AFTER shard_wan_model_for_tp.
+        if getattr(args, 'fp4_gemm', False):
+            enable_fp4_gemm(self.wan_i2v_model, options=FP4GemmOptions())
         if args.block_offload:
             for name, child in self.wan_i2v_model.named_children():
                 if name != 'blocks':
@@ -174,16 +194,26 @@ class DistributedVideoEngine:
         self.blksz_lst = [6, 8]
         self.frame_len = (self.height // (self.patch_size[1] * self.vae_stride[1])) * (
                     self.width // (self.patch_size[2] * self.vae_stride[2]))
-        kv_cache_tokens = self.frame_len * sum(self.blksz_lst) // self.world_size
+        if getattr(args, 'tp', False):
+            # TP path: cache holds full seq, num_heads sharded across ranks.
+            kv_cache_tokens = self.frame_len * sum(self.blksz_lst)
+            kv_cache_heads = 40 // max(self.world_size, 1)
+            assert 40 % max(self.world_size, 1) == 0, (
+                f"--tp requires num_heads (40) divisible by world_size; got world_size={self.world_size}"
+            )
+        else:
+            # SP path: cache holds rank's seq slice, full num_heads.
+            kv_cache_tokens = self.frame_len * sum(self.blksz_lst) // self.world_size
+            kv_cache_heads = 40
         kv_cache_device = self.device
         kv_cache_dtype = torch.float8_e4m3fn if args.fp8_kv_cache else torch.bfloat16
-        kv_scale_shape = (1, kv_cache_tokens, 40, 1)
+        kv_scale_shape = (1, kv_cache_tokens, kv_cache_heads, 1)
         self.kv_cache  = \
             {
                 i: {
                     layer_id: {
-                        'k': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
-                        'v': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+                        'k': torch.zeros([1, kv_cache_tokens, kv_cache_heads, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+                        'v': torch.zeros([1, kv_cache_tokens, kv_cache_heads, 128], dtype=kv_cache_dtype, device=kv_cache_device),
                         'k_scale': torch.ones(kv_scale_shape, dtype=torch.float32,
                                               device=kv_cache_device) if args.fp8_kv_cache else None,
                         'v_scale': torch.ones(kv_scale_shape, dtype=torch.float32,
@@ -628,6 +658,7 @@ class DistributedVideoEngine:
             # 4. 主循环
             iter_total_num = int(audio_len_sec / (self.vae_stride[0] * self.blksz_lst[-1] / fps)) + 1
             pre_latent = None
+            chunk_times = []
 
             if self.rank == 0:
                 update_task_status(
@@ -706,6 +737,12 @@ class DistributedVideoEngine:
                     write_chunk_bytes(save_ffmpeg_process, chunk_bytes, name="save_ffmpeg")
 
                     m3u8_path = os.path.join(task_hls_dir, M3U8_NAME)
+                    chunk_elapsed = time.perf_counter() - start_time
+                    chunk_times.append(chunk_elapsed)
+                    chunk_fps = num_frames_this_chunk / chunk_elapsed if chunk_elapsed > 0 else 0.0
+                    avg_s = sum(chunk_times) / len(chunk_times)
+                    min_s = min(chunk_times)
+                    max_s = max(chunk_times)
                     update_task_status(
                         task_id,
                         status="running",
@@ -715,12 +752,19 @@ class DistributedVideoEngine:
                         generated_chunks=iteration + 1,
                         is_done=False,
                         stream_ready=os.path.exists(m3u8_path),
+                        last_chunk_s=round(chunk_elapsed, 3),
+                        last_chunk_frames=num_frames_this_chunk,
+                        last_chunk_fps=round(chunk_fps, 2),
+                        avg_chunk_s=round(avg_s, 3),
+                        min_chunk_s=round(min_s, 3),
+                        max_chunk_s=round(max_s, 3),
                     )
 
                     print(
                         f"生成完成 {iteration + 1}/{iter_total_num}, "
                         f"frames={num_frames_this_chunk}, "
-                        f"一个chunk耗时:{time.perf_counter() - start_time:.4f}s",
+                        f"一个chunk耗时:{chunk_elapsed:.4f}s "
+                        f"({chunk_fps:.2f} FPS, avg {avg_s:.3f}s)",
                         flush=True
                     )
 
@@ -927,6 +971,21 @@ if __name__ == '__main__':
         action="store_true",
         default=False,
         help="Whether to offload WanModel blocks to CPU between block forwards.")
+    parser.add_argument(
+        "--tp",
+        action="store_true",
+        default=False,
+        help="Use tensor-parallel WanModel (model_liveact/model_memory_tp.py). "
+             "Supports world_size in {1,2,4,8}. Default uses Ulysses sequence "
+             "parallelism (model_memory_sp.py), which only supports world_size <= 2.")
+    parser.add_argument(
+        "--fp4_gemm",
+        action="store_true",
+        default=False,
+        help="Wrap nn.Linear with NVFP4 W4A4 GEMM (Blackwell SM100+ only — "
+             "B100/B200/RTX 5090/6000). Mutually exclusive with --fp8_gemm. "
+             "Falls back to BF16 silently on unsupported GPUs unless "
+             "VLLM_USE_NVFP4_CT_EMULATIONS=1 is set for software emulation.")
     args = parser.parse_args()
 
     try:

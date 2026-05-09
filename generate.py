@@ -25,6 +25,7 @@ from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 from diffusers.utils import export_to_video
 
 from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
+from fp4_gemm import FP4GemmOptions, enable_fp4_gemm
 
 
 torch.backends.cudnn.benchmark = True
@@ -108,6 +109,21 @@ def _parse_args():
         type=int,
         default=42,
         help="The seed to use for generating the image or video.")
+    parser.add_argument(
+        "--tp",
+        action="store_true",
+        default=False,
+        help="Use tensor-parallel WanModel (model_liveact/model_memory_tp.py). "
+             "Supports world_size in {1,2,4,8}. Default uses Ulysses sequence "
+             "parallelism (model_memory_sp.py), which only supports world_size <= 2.")
+    parser.add_argument(
+        "--fp4_gemm",
+        action="store_true",
+        default=False,
+        help="Wrap nn.Linear with NVFP4 W4A4 GEMM (Blackwell SM100+ only — "
+             "B100/B200/RTX 5090/6000). Mutually exclusive with --fp8_gemm. "
+             "Falls back to BF16 silently on unsupported GPUs unless "
+             "VLLM_USE_NVFP4_CT_EMULATIONS=1 is set for software emulation.")
 
     args = parser.parse_args()
 
@@ -147,7 +163,13 @@ def generate(args):
             ulysses_degree=world_size,
         )
 
-    if world_size > 1:
+    if args.tp:
+        # Tensor-parallel: cache is head-sharded (full seq, num_heads/world per rank).
+        # Works for world_size in {1, 2, 4, 8}.
+        from model_liveact.model_memory_tp import WanModel
+    elif world_size > 1:
+        # Sequence-parallel (Ulysses): cache is seq-sharded (full heads, 14*fs/world tokens per rank).
+        # Hardcoded for world_size <= 2.
         from model_liveact.model_memory_sp import WanModel
     else:
         from model_liveact.model_memory import WanModel
@@ -159,16 +181,26 @@ def generate(args):
     timesteps = [torch.tensor([_]).to(device, dtype=torch.float32) for _ in [1000.0, 937.5, 833.33333333, 0.0]]
     blksz_lst = [6, 8]
     frame_len = (height // (patch_size[1] * vae_stride[1])) * (width // (patch_size[2] * vae_stride[2]))
-    kv_cache_tokens = frame_len * sum(blksz_lst) // world_size
+    if args.tp:
+        # TP path: cache holds the full seq, with num_heads sharded across ranks.
+        kv_cache_tokens = frame_len * sum(blksz_lst)
+        kv_cache_heads = 40 // max(world_size, 1)
+        assert 40 % max(world_size, 1) == 0, (
+            f"--tp requires num_heads (40) divisible by world_size; got world_size={world_size}"
+        )
+    else:
+        # SP path: cache holds the rank's seq slice, full num_heads.
+        kv_cache_tokens = frame_len * sum(blksz_lst) // world_size
+        kv_cache_heads = 40
     kv_cache_device = 'cpu' if args.offload_cache else device
     kv_cache_dtype = torch.float8_e4m3fn if args.fp8_kv_cache else torch.bfloat16
-    kv_scale_shape = (1, kv_cache_tokens, 40, 1)
+    kv_scale_shape = (1, kv_cache_tokens, kv_cache_heads, 1)
     kv_cache = \
         {
             i: {
                 layer_id: {
-                    'k': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
-                    'v': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+                    'k': torch.zeros([1, kv_cache_tokens, kv_cache_heads, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+                    'v': torch.zeros([1, kv_cache_tokens, kv_cache_heads, 128], dtype=kv_cache_dtype, device=kv_cache_device),
                     'k_scale': torch.ones(kv_scale_shape, dtype=torch.float32, device=kv_cache_device) if args.fp8_kv_cache else None,
                     'v_scale': torch.ones(kv_scale_shape, dtype=torch.float32, device=kv_cache_device) if args.fp8_kv_cache else None,
                     'mean_memory': args.mean_memory,
@@ -182,8 +214,8 @@ def generate(args):
         kv_cache_null_audio = \
             {
                 i: {layer_id: {
-                    'k': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
-                    'v': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+                    'k': torch.zeros([1, kv_cache_tokens, kv_cache_heads, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+                    'v': torch.zeros([1, kv_cache_tokens, kv_cache_heads, 128], dtype=kv_cache_dtype, device=kv_cache_device),
                     'k_scale': torch.ones(kv_scale_shape, dtype=torch.float32, device=kv_cache_device) if args.fp8_kv_cache else None,
                     'v_scale': torch.ones(kv_scale_shape, dtype=torch.float32, device=kv_cache_device) if args.fp8_kv_cache else None,
                     'mean_memory': args.mean_memory,
@@ -197,7 +229,21 @@ def generate(args):
     for n in range(40):
         wan_i2v_model.blocks[n].self_attn.init_kvidx(frame_len, world_size)
 
-    enable_fp8_gemm(wan_i2v_model, options=FP8GemmOptions())
+    if args.tp and world_size > 1:
+        # Pre-slice TP-relevant weights so FP8 GEMM can wrap them transparently.
+        # MUST run BEFORE enable_fp8_gemm.
+        from model_liveact.model_memory_tp import shard_wan_model_for_tp
+        shard_wan_model_for_tp(wan_i2v_model)
+
+    # Disabled: vllm 0.11.0 (CUDA 12) incompatible with system CUDA 13. Re-enable after upgrading vllm to a cu13 build.
+    # When re-enabled, this call must come AFTER shard_wan_model_for_tp above so that FP8Linear
+    # wraps the rank-local weight tensors and quantizes only that rank's slice.
+    # enable_fp8_gemm(wan_i2v_model, options=FP8GemmOptions())
+    # FP4 path (Blackwell only). Mutually exclusive with --fp8_gemm; both
+    # paths require vllm so the same cu13 caveat above applies. Wrap order
+    # is identical: must run AFTER shard_wan_model_for_tp.
+    if args.fp4_gemm:
+        enable_fp4_gemm(wan_i2v_model, options=FP4GemmOptions())
     if args.block_offload:
         for name, child in wan_i2v_model.named_children():
             if name != 'blocks':
@@ -273,8 +319,8 @@ def generate(args):
         audio_ori, sr_ori = torchaudio.load(audio_path)  # y: [channels, time]
         def resample_audio(audio, sr, fps):
             rate = 25 / fps
-            effects = [["tempo", f"{rate}"], ]
-            y, sr = torchaudio.sox_effects.apply_effects_tensor(audio, sr, effects)
+            # torchaudio dropped sox_effects in 2.11; functional.speed is the documented replacement
+            y, _ = torchaudio.functional.speed(audio, sr, factor=rate)
             resampler = T.Resample(sr, 16000)
             return resampler(y) * 3.0, 16000
 

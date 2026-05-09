@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Model checkpoints (download separately via Hugging Face / ModelScope)
+checkpoints/
+chinese-wav2vec2-base/
+
+# Runtime artifacts
+generated_videos/
+hls_output/
+uploads/
+tmp.mp4
+1_1.mp4
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

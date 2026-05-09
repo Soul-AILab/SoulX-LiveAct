@@ -108,8 +108,7 @@ def flash_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
-    else:
-        assert FLASH_ATTN_2_AVAILABLE
+    elif FLASH_ATTN_2_AVAILABLE:
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -125,6 +124,20 @@ def flash_attention(
             causal=causal,
             window_size=window_size,
             deterministic=deterministic).unflatten(0, (b, lq))
+    else:
+        # SDPA fallback for systems without flash_attn (e.g. Blackwell/aarch64).
+        # Reshape varlen-packed [(B*Lq), Nq, C] back to [B, Nq, Lq, C] for SDPA.
+        q_b = q.unflatten(0, (b, lq)).transpose(1, 2)
+        k_b = k.unflatten(0, (b, lk)).transpose(1, 2)
+        v_b = v.unflatten(0, (b, lk)).transpose(1, 2)
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q_b, k_b, v_b,
+            attn_mask=None,
+            is_causal=causal,
+            dropout_p=dropout_p,
+            scale=softmax_scale,
+        )
+        x = x.transpose(1, 2).contiguous()
 
     # output
     return x.type(out_dtype)
