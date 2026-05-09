@@ -484,6 +484,7 @@
         <div class="task-status-card">
             <div><strong>Task State:</strong> <span id="task-state">Idle</span></div>
             <div><strong>Chunk Progress:</strong> <span id="chunk-progress">0 / 0</span></div>
+            <div><strong>Chunk Time:</strong> <span id="chunk-time">—</span></div>
             <div><strong>Stream Ready:</strong> <span id="stream-ready">No</span></div>
             <div><strong>Done:</strong> <span id="task-done">No</span></div>
             <div class="task-message" id="task-message">等待任务启动</div>
@@ -506,6 +507,17 @@
         document.getElementById('task-state').innerText = data.stage || data.status || 'unknown';
         document.getElementById('chunk-progress').innerText =
             `${data.generated_chunks ?? 0} / ${data.total_chunks ?? '?'}`;
+        if (data.last_chunk_s !== undefined && data.last_chunk_s !== null) {
+            const last = Number(data.last_chunk_s).toFixed(2);
+            const fps = Number(data.last_chunk_fps ?? 0).toFixed(2);
+            const avg = Number(data.avg_chunk_s ?? 0).toFixed(2);
+            const min = Number(data.min_chunk_s ?? 0).toFixed(2);
+            const max = Number(data.max_chunk_s ?? 0).toFixed(2);
+            document.getElementById('chunk-time').innerText =
+                `last ${last}s (${fps} FPS) · avg ${avg}s · min ${min}s · max ${max}s`;
+        } else {
+            document.getElementById('chunk-time').innerText = '—';
+        }
         document.getElementById('stream-ready').innerText = data.stream_ready ? 'Yes' : 'No';
         document.getElementById('task-done').innerText = data.is_done ? 'Yes' : 'No';
         document.getElementById('task-message').innerText = data.message || '';
