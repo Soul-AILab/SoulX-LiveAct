@@ -4,7 +4,7 @@
 
 # SoulX-LiveAct: Towards Hour-Scale Real-Time Human Animation with Neighbor Forcing and ConvKV Memory
 
-[Dingcheng Zhen*<sup>&#9993;</sup>](https://scholar.google.com/citations?user=jSLx3CcAAAAJ) · [Xu Zheng*](https://scholar.google.com/citations?user=Ii1c51QAAAAJ) · [Ruixin Zhang*](https://openreview.net/profile?id=~Ruixin_Zhang5) · [Zhiqi Jiang*](https://openreview.net/profile?id=~Zhiqi_Jiang3)
+[Dingcheng Zhen*<sup>&#9993;</sup>](https://scholar.google.com/citations?user=jSLx3CcAAAAJ) · [Xu Zheng*]([https://scholar.google.com/citations?user=Ii1c51QAAAAJ](https://zhengxujosh.github.io/)) · [Ruixin Zhang*](https://openreview.net/profile?id=~Ruixin_Zhang5) · [Zhiqi Jiang*](https://openreview.net/profile?id=~Zhiqi_Jiang3)
 
 [Yichao Yan]() · [Ming Tao]() · [Shunshun Yin]()
 
